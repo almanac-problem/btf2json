@@ -10,12 +10,17 @@ use std::convert::TryFrom;
 
 use anyhow::{Error, Result};
 
+pub mod banner;
 pub mod btf;
 pub mod cli;
 pub mod elf;
+pub mod image;
 pub mod isf;
+pub mod kallsyms;
+pub mod kaslr;
 pub mod metadata;
 pub mod symbols;
+pub mod utils;
 pub mod v_symbols;
 pub mod v_types;
 

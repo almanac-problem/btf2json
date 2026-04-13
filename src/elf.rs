@@ -22,6 +22,30 @@ pub fn is_elf(raw: &[u8]) -> Result<Endian> {
     }
 }
 
+pub fn get_size(elf: &Elf) -> Result<u64> {
+    let ehdr = elf.header;
+    let mut size: u64 = 0;
+
+    if ehdr.e_shoff > 0 {
+        size = ehdr.e_shoff + (ehdr.e_shentsize as u64 * ehdr.e_shnum as u64);
+    }
+
+    if ehdr.e_phoff > 0 {
+        let max_ph: u64 = elf
+            .program_headers
+            .iter()
+            .map(|ph| ph.p_offset + ph.p_filesz)
+            .max()
+            .context("Error while iterating ELF program headers")?;
+
+        if max_ph > size {
+            size = max_ph;
+        }
+    }
+
+    Ok(size)
+}
+
 /// Returns the `.BTF` section of the ELF file.
 pub fn extract_btfsec(raw: &[u8]) -> Result<&[u8]> {
     let elf = Elf::parse(raw)?;

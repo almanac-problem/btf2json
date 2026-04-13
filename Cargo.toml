@@ -13,16 +13,22 @@ path = "src/lib.rs"
 name = "btf2json"
 path = "src/bin/btf2json.rs"
 
+[[bin]]
+name = "memscan"
+path = "src/bin/mem_scan.rs"
+
 [dependencies]
-anyhow = "1.0.76"
-base64 = "0.21.7"
-btf-rs = "1.1.1"
-clap = { version = "4.4.11", features = ["derive"] }
-env_logger = "0.10.1"
-goblin = "0.8.0"
-log = "0.4.20"
-memmap = "0.7.0"
+anyhow = "1.0.102"
+base64 = "0.22.1"
+btf-rs = "=1.1.0"
+clap = { version = "4.6.0", features = ["derive"] }
+env_logger = "0.11.10"
+goblin = "0.10.5"
+log = "0.4.29"
+memchr = "2.8.0"
+memmap2 = "0.9.10"
+regex = "1.12.3"
 rust-crypto = "0.2.36"
-rust-embed = { version = "8.2.0", features = ["debug-embed"] }
-serde = { version = "1.0.193", features = ["derive"] }
-serde_json = "1.0.108"
+rust-embed = { version = "8.11.0", features = ["debug-embed"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"

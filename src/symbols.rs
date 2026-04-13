@@ -1,22 +1,24 @@
 //! Generation of symbol information.
 
-use crate::btf::Btf;
+use crate::banner::{Architectures, Banner};
+use crate::btf::{Btf, SourceRaw};
 use crate::cli::Cli;
-use crate::elf;
+use crate::image::raw::RawImage;
+use crate::kallsyms::{carve_kallsyms, Kallsyms};
+use crate::kaslr::find_kaslr_slide;
 
 use std::collections::{HashMap, HashSet};
 use std::convert::TryFrom;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::iter::{IntoIterator, Iterator};
-use std::path::Path;
 use std::path::PathBuf;
 use std::rc::Rc;
-use std::str;
+use std::{iter::zip, str};
 
 use anyhow::{bail, Context, Error, Result};
 use base64::prelude::*;
-use memmap::Mmap;
+use memmap2::Mmap;
 use rust_embed::RustEmbed;
 
 /// The embedded symdb.
@@ -74,7 +76,7 @@ impl IntoIterator for SymDb {
 /// Symbol information that we have about the kernel.
 #[derive(Default)]
 pub struct Symbols {
-    raw_map: Option<Rc<Mmap>>,
+    raw_map: Option<Rc<SourceRaw>>,
     name_map: Option<String>,
     raw_symdb: Option<&'static [u8]>,
     name_symdb: Option<&'static str>,
@@ -98,7 +100,7 @@ impl Symbols {
 
     /// Get memory mapping of the System.map that was used to construct these
     /// `Symbols`.
-    pub fn raw_map(&self) -> Option<Rc<Mmap>> {
+    pub fn raw_map(&self) -> Option<Rc<SourceRaw>> {
         self.raw_map.as_ref().map(|p| p.clone())
     }
 
@@ -260,7 +262,58 @@ impl SymbolsBuilder {
         );
         let file = File::open(map)?;
         let mmap = unsafe { Mmap::map(&file) }?;
-        self.0.raw_map = Some(Rc::new(mmap));
+        self.0.raw_map = Some(Rc::new(SourceRaw::Mapped(mmap)));
+        self.0.name_map = Some(name_map);
+
+        Ok(self)
+    }
+
+    /// Add symbol information from a carved Kallsyms
+    fn add_from_kallsyms(mut self, kallsyms: &Kallsyms, kaslr_slide: u64) -> Result<Self> {
+        let mut kallsyms_symbols: HashMap<String, Symbol> = HashMap::new();
+        // Names are not suitable to disambiguate symbols. ISF nevertheless does
+        // just that. If a symbol name appears more than once we ignore it all
+        // together.
+        let mut ambiguous_names: HashSet<String> = HashSet::new();
+
+        for (runtime_addr, sym_name_with_scope) in
+            zip(&kallsyms.symbol_offsets, &kallsyms.symbol_names)
+        {
+            // Adjust address for kaslr and extract scope from symbol name
+            let addr = runtime_addr - kaslr_slide;
+            let mut sym_chars = sym_name_with_scope.chars();
+            let Some(scope) = sym_chars.next() else {
+                bail!("Invalid symbol name: {}", sym_name_with_scope);
+            };
+            let name = sym_chars.as_str(); // Iterator is advanced with next(), so this is just the symbol name
+
+            if ambiguous_names.contains(name) {
+                continue;
+            }
+            if kallsyms_symbols.contains_key(name) {
+                kallsyms_symbols.remove(name);
+                ambiguous_names.insert(String::from(name));
+                log::trace!("Symbol name {} is ambiguous, dropping.", name);
+                continue;
+            }
+
+            kallsyms_symbols.insert(
+                String::from(name),
+                Symbol {
+                    addr,
+                    t: None,
+                    kind: SymbolKind::try_from(&scope)?,
+                    scope: SymbolScope::from(&scope),
+                    constant_data: None,
+                },
+            );
+        }
+
+        self.0.symbols.extend(kallsyms_symbols);
+
+        // record metadata
+        let name_map = String::from("Carved kallsyms");
+        self.0.raw_map = None;
         self.0.name_map = Some(name_map);
 
         Ok(self)
@@ -315,7 +368,12 @@ impl TryFrom<&Cli> for SymbolsBuilder {
             SymbolsBuilder::new().add_from_system_map(cli.map.as_ref().unwrap())
         } else if cli.image.is_some() {
             log::debug!("Got memory image, extracting symbol information.");
-            bail!("Extraction of symbols from memory image is not implemented.")
+
+            // TODO: Abstract after other source types are implemented
+            let image = RawImage::open(cli.image.as_ref().unwrap())?;
+            let kallsyms = carve_kallsyms(&image)?;
+            let kaslr_slide = find_kaslr_slide(&image, Architectures::x86_64)?; // TODO: Obviously change this, need to implement an architecture identification process
+            SymbolsBuilder::new().add_from_kallsyms(&kallsyms, kaslr_slide)
         } else {
             bail!("No source for symbol information provided.")
         }?;
@@ -329,57 +387,5 @@ impl TryFrom<&Cli> for SymbolsBuilder {
         );
 
         Ok(sym_builder)
-    }
-}
-
-/// Linux banner.
-pub struct Banner(String);
-
-impl std::fmt::Display for Banner {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.0.fmt(f)
-    }
-}
-
-impl AsRef<[u8]> for Banner {
-    fn as_ref(&self) -> &[u8] {
-        self.0.as_bytes()
-    }
-}
-
-impl Banner {
-    fn from_btfsec(raw: &[u8]) -> Result<Self> {
-        elf::is_elf(raw)?;
-        let banner = elf::get_banner(raw)?;
-
-        Ok(Banner(banner))
-    }
-}
-
-impl TryFrom<&Cli> for Banner {
-    type Error = Error;
-
-    fn try_from(cli: &Cli) -> Result<Banner> {
-        if cli.banner.is_some() {
-            return Ok(Banner(cli.banner.as_ref().unwrap().to_owned()));
-        };
-
-        if cli.btf.is_some() {
-            let file_path: &Path = Path::new(cli.btf.as_ref().unwrap());
-            let file = File::open(file_path)?;
-            let mmap = unsafe { Mmap::map(&file)? };
-
-            let banner = Banner::from_btfsec(&mmap);
-
-            if banner.is_ok() {
-                return banner;
-            }
-        };
-
-        if cli.image.is_some() {
-            bail!("Extraction of Linux banner from memory image is not implemented.")
-        }
-
-        bail!("Unable to find Linux banner.")
     }
 }

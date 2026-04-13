@@ -8,6 +8,8 @@
 
 use crate::cli::Cli;
 use crate::elf;
+use crate::image::raw::RawImage;
+use crate::image::traits::MemoryImage;
 
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::convert::TryFrom;
@@ -19,16 +21,37 @@ use std::rc::Rc;
 
 use anyhow::{bail, Context, Error, Result};
 use btf_rs::BtfType;
-use memmap::Mmap;
+use memmap2::Mmap;
 
 const BTF_MAGIC_BE: [u8; 2] = [0xeb, 0x9f];
 const BTF_MAGIC_LE: [u8; 2] = [0x9f, 0xeb];
+const BTF_HDR_LEN_MIN: usize = 24;
+/// Arbitrary plausible minimum for BTF section size
+const BTF_SIZE_MIN: usize = 100_000;
+/// Arbitrary plausible maximum for BTF section size
+const BTF_SIZE_MAX: usize = 50_000_000;
 
 /// Represents a partitioning of the types into the categories that Volatility
 /// distinguishes between, plus a processed view of all typedefs. The starting
 /// point for generating an ISF file.
 pub type VolIdSets = (BTreeSet<Id>, BTreeSet<Id>, BTreeSet<Id>, Typedefs);
 
+#[derive(Debug)]
+pub enum SourceRaw {
+    Mapped(Mmap),
+    Carved(Vec<u8>),
+}
+
+impl AsRef<[u8]> for SourceRaw {
+    fn as_ref(&self) -> &[u8] {
+        match self {
+            SourceRaw::Carved(bytes) => bytes,
+            SourceRaw::Mapped(mmap) => mmap,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Endian {
     Big,
     Little,
@@ -37,7 +60,7 @@ pub enum Endian {
 /// Representation of a BTF file.
 pub struct Btf {
     pub endian: Endian,
-    raw: Rc<Mmap>,
+    raw: Rc<SourceRaw>,
     name: String,
     btf: btf_rs::Btf,
 }
@@ -47,6 +70,7 @@ impl TryFrom<&Cli> for Btf {
 
     fn try_from(cli: &Cli) -> Result<Self> {
         if cli.btf.is_some() {
+            log::debug!("Provided separate file for BTF, extracing section.");
             let file_path: &Path = Path::new(cli.btf.as_ref().unwrap());
             let file = File::open(file_path)?;
             let mmap = unsafe { Mmap::map(&file)? };
@@ -54,7 +78,7 @@ impl TryFrom<&Cli> for Btf {
             let btf = btf_rs::Btf::from_bytes(btf_sec)?;
             Ok(Btf {
                 endian,
-                raw: Rc::new(mmap),
+                raw: Rc::new(SourceRaw::Mapped(mmap)),
                 name: file_path
                     .file_name()
                     .context("")?
@@ -65,7 +89,17 @@ impl TryFrom<&Cli> for Btf {
             })
         } else if cli.image.is_some() {
             log::debug!("Got memory image, extracting BTF section.");
-            bail!("BTF extraction from memory image is not implemented!")
+
+            // TODO: Abstract after other source types are implemented
+            let image = RawImage::open(cli.image.as_ref().unwrap())?;
+            let (endian, btf_bytes) = carve_btf(&image)?;
+            let btf = btf_rs::Btf::from_bytes(btf_bytes)?;
+            Ok(Btf {
+                endian,
+                raw: Rc::new(SourceRaw::Carved(btf_bytes.to_vec())),
+                name: format!("carved-from-{}", image.name()),
+                btf,
+            })
         } else {
             bail!("No source for BTF information provided!")
         }
@@ -76,7 +110,7 @@ impl Btf {
     const MAX_BTF_ID: Id = Id(0xFFFFFFFF);
 
     /// Returns the memory-mapped BTF file.
-    pub fn raw(&self) -> Rc<Mmap> {
+    pub fn raw(&self) -> Rc<SourceRaw> {
         self.raw.clone()
     }
 
@@ -661,4 +695,93 @@ fn get_btf_section(mmap: &Mmap) -> Result<(Endian, &[u8])> {
             mmap[0]
         )
     }
+}
+
+// BTF Carving
+// More specific scanning to reduce false positives
+// BTF version has not changed since inception
+// Flags
+const BTF_SCANNING_MAGIC_BE: [u8; 4] = [0xeb, 0x9f, 0x01, 0x00];
+const BTF_SCANNING_MAGIC_LE: [u8; 4] = [0x9f, 0xeb, 0x01, 0x00];
+
+pub fn carve_btf<I: MemoryImage>(image: &I) -> Result<(Endian, &[u8])> {
+    let data = image.as_ref();
+
+    let mut best = (0, 0, Endian::Little);
+
+    for (magic, endian) in [
+        (&BTF_SCANNING_MAGIC_LE[..], Endian::Little),
+        (&BTF_SCANNING_MAGIC_BE[..], Endian::Big),
+    ] {
+        for offset in image.scan_bytes(magic) {
+            let Some(btf_size) = btf_heuristics(data, offset, &endian) else {
+                continue;
+            };
+
+            if btf_size > best.1 {
+                best = (offset, btf_size, endian);
+            }
+        }
+    }
+
+    let btf_bytes = &data[best.0..best.0 + best.1];
+
+    Ok((best.2, btf_bytes))
+}
+
+// Based on https://www.kernel.org/doc/html/latest/bpf/btf.html and manually tested heuristics
+pub fn btf_heuristics(data: &[u8], offset: usize, endian: &Endian) -> Option<usize> {
+    if offset + BTF_HDR_LEN_MIN > data.len() {
+        return None;
+    }
+
+    let hdr = &data[offset..];
+
+    let read_u32 = if *endian == Endian::Big {
+        |d: &[u8], off: usize| u32::from_be_bytes(d[off..off + 4].try_into().unwrap())
+    } else {
+        |d: &[u8], off: usize| u32::from_le_bytes(d[off..off + 4].try_into().unwrap())
+    };
+
+    let hdr_len = read_u32(hdr, 4) as usize;
+    let type_off = read_u32(hdr, 8) as usize;
+    let type_len = read_u32(hdr, 12) as usize;
+    let str_off = read_u32(hdr, 16) as usize;
+    let str_len = read_u32(hdr, 20) as usize;
+
+    // Basic header validation
+    if hdr_len < BTF_HDR_LEN_MIN {
+        return None;
+    }
+    if type_len == 0 || str_len == 0 {
+        return None;
+    }
+
+    // Calculate total size
+    let data_end = std::cmp::max(type_off + type_len, str_off + str_len);
+    let total_size = hdr_len + data_end;
+
+    // Size sanity check - Drastically cut down scan times when testing
+    if total_size < BTF_SIZE_MIN || total_size > BTF_SIZE_MAX {
+        return None;
+    }
+
+    // Bounds check
+    if offset + total_size > data.len() {
+        return None;
+    }
+
+    // First byte of string section must be \0
+    let str_start = offset + hdr_len + str_off;
+    if str_start >= data.len() || data[str_start] != 0 {
+        return None;
+    }
+
+    // Try parsing with btf_rs to confirm validity
+    let btf_bytes = &data[offset..offset + total_size];
+    if btf_rs::Btf::from_bytes(btf_bytes).is_err() {
+        return None;
+    }
+
+    Some(total_size)
 }

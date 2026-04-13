@@ -18,3 +18,4 @@ test
 btf-rs/
 scripts/
 test_data/
+.python-version

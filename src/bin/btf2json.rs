@@ -22,27 +22,28 @@ fn main() {
 
     if cli.version {
         println!("v{}", VERSION);
-    } else {
-        let ctx = match GenerationContext::try_from(&cli) {
-            Ok(ctx) => ctx,
-            Err(err) => {
-                println!("Unable to gather information for ISF generation: {}", err);
-                exit(1);
+        return;
+    }
+
+    let ctx = match GenerationContext::try_from(&cli) {
+        Ok(ctx) => ctx,
+        Err(err) => {
+            println!("Unable to gather information for ISF generation: {}", err);
+            exit(1);
+        }
+    };
+    match Isf::try_from(ctx) {
+        Ok(mut isf) => {
+            // We do not fail if types are broken.
+            let _ = isf.fix_symbol_types();
+            if cfg!(debug_assertions) {
+                let _ = isf.check_user_types();
             }
-        };
-        match Isf::try_from(ctx) {
-            Ok(mut isf) => {
-                // We do not fail if types are broken.
-                let _ = isf.fix_symbol_types();
-                if cfg!(debug_assertions) {
-                    let _ = isf.check_user_types();
-                }
-                isf.dump_stdout()
-            }
-            Err(err) => {
-                println!("Unable to generate ISF file: {}", err);
-                exit(1);
-            }
+            isf.dump_stdout()
+        }
+        Err(err) => {
+            println!("Unable to generate ISF file: {}", err);
+            exit(1);
         }
     }
 }

@@ -1,6 +1,6 @@
 //! ISF Metadata.
 
-use crate::btf::Btf;
+use crate::btf::{Btf, SourceRaw};
 use crate::symbols::Symbols;
 
 use std::convert::From;
@@ -8,7 +8,6 @@ use std::rc::Rc;
 
 use crypto::digest::Digest;
 use crypto::sha2::Sha256;
-use memmap::Mmap;
 use serde::Serialize;
 
 /// Representation of the ISF metadata object.
@@ -53,8 +52,8 @@ impl<T, U, const K: u32> CompMeta<T, U, K> {
     }
 }
 
-type BtfMeta = CompMeta<Rc<Mmap>, String, { SourceKind::Btf as u32 }>;
-type MapMeta = CompMeta<Rc<Mmap>, String, { SourceKind::SystemMap as u32 }>;
+type BtfMeta = CompMeta<Rc<SourceRaw>, String, { SourceKind::Btf as u32 }>;
+type MapMeta = CompMeta<Rc<SourceRaw>, String, { SourceKind::SystemMap as u32 }>;
 type SymDbMeta = CompMeta<&'static [u8], &'static str, { SourceKind::Symdb as u32 }>;
 
 /// Builder for [`Metadata`].
